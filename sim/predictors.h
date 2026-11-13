@@ -263,6 +263,7 @@ class TAGEPredictor : public BranchPredictorBase {
     size_t _idx_width;
     size_t _tag_width;
     size_t _table_size;
+    size_t _bank_size;
     size_t _pc_mask;
     size_t _tag_mask;
     constexpr static size_t U = 2;
@@ -359,20 +360,21 @@ class TAGEPredictor : public BranchPredictorBase {
     }
     
     public:
-        TAGEPredictor(size_t idx_width, size_t tag_width, u8 num_comp, u16 L1, float ratio) :
+        TAGEPredictor(size_t base_table_size, size_t idx_width, size_t tag_width, u8 num_comp, u16 L1, float ratio) :
                 _idx_width(idx_width), _tag_width(tag_width), 
-                _table_size(1ull << idx_width), 
+                _table_size(1ull << base_table_size), _bank_size(1ull<<_idx_width),
                 _pc_mask(_table_size - 1), _tag_mask((1ull << tag_width) - 1),
                 _history_buffer(),
                 _pred_table(_table_size, SatCounter<2>()), 
-                _banks(NC, std::vector<TagEntry<U>>(_table_size, TagEntry<U>()))
+                _banks(NC, std::vector<TagEntry<U>>(1ull << _idx_width, TagEntry<U>()))
             {
                 float factor = 1.0;
                 for (int i = 0; i < NC; i++) {
                     u16 hl = L1 * factor;
-                    // std::cout << hl << std::endl;
+                    std::cout << "hl " << i << ": " << hl << std::endl;
                     if (hl > H) {
                         char err_msg[50];
+                        
                         snprintf(err_msg, 49, "%d is greater than the max history length of %d",hl, H);
                         throw(std::runtime_error(err_msg));
                     }
@@ -384,7 +386,7 @@ class TAGEPredictor : public BranchPredictorBase {
 
                     factor *= ratio;
                 }
-                COLLECT_FP_REGISTER(std::vector<size_t>(NC, _table_size));
+                COLLECT_FP_REGISTER(std::vector<size_t>(NC, _bank_size));
         }
 
         ~TAGEPredictor() {}
@@ -461,7 +463,7 @@ class TAGEPredictor : public BranchPredictorBase {
                 u32 tag_hash = _hashes[2*i+1].hash;
                 u32 tag_hash_2 = _hashes_2[i].hash;
 
-                u16 idx = idx_hash ^ (pc & _pc_mask);
+                u16 idx = (idx_hash ^ (pc & _pc_mask)) & (_bank_size - 1);
                 u16 tag = tag_hash ^ (tag_hash_2 << 1) ^ (pc & _tag_mask);
 
                 _idx_cache[i] = idx;
@@ -495,10 +497,15 @@ class TAGEPredictor : public BranchPredictorBase {
         std::string predictor_name() const override { return "TAGE"; }
 
         u64 get_size() const override {
+            u64 size_out = 0;
+
             u64 bits_per_table = 3 + 2 + _tag_width + 1; // 3-bt ctr, 2-bit u, _tag_width bit tag, allocated bit
             u64 bits_in_base = 2 * _table_size;
             u64 csrs = NC * (_idx_width + _tag_width + _tag_width - 1);
-            return bits_per_table * _table_size * NC + bits_in_base + H + csrs;
+            size_out += bits_per_table * _bank_size * NC;
+            size_out += bits_in_base;
+            size_out +=  H + csrs;
+            return size_out;
         }
 
         void print_stats() const {
