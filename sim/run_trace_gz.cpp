@@ -12,8 +12,11 @@
 //     g++ -std=c++20 -O2 run_trace_gz.cpp -lz -o build/run_trace_gz
 //
 // Run:
-//     build/run_trace_gz <trace.gz> [--limit N]
-//       --limit N   stop after reading N instructions (0 = whole trace)
+//     build/run_trace_gz <trace.gz> [--limit N] [--csv PATH]
+//       --limit N    stop after reading N instructions (0 = whole trace)
+//       --csv PATH   append one result row per predictor to PATH (header on new
+//                    file); budget_kb column (from predictor_params.h) tags the
+//                    size point, so repeated runs build a sweep table.
 //
 // Predictor geometry comes from predictor_params.h, so this driver stays in
 // lock-step with sizing.cpp (same sizes).
@@ -139,14 +142,17 @@ public:
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <trace.gz> [--limit N]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <trace.gz> [--limit N] [--csv PATH]\n", argv[0]);
         return 2;
     }
     const char* path = argv[1];
     uint64_t limit = 0;
+    const char* csv_path = nullptr;
     for (int i = 2; i < argc; i++) {
         if (!std::strcmp(argv[i], "--limit") && i + 1 < argc)
             limit = std::strtoull(argv[++i], nullptr, 10);
+        else if (!std::strcmp(argv[i], "--csv") && i + 1 < argc)
+            csv_path = argv[++i];
         else { std::fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
     }
 
@@ -193,6 +199,37 @@ int main(int argc, char** argv) {
                     preds[k]->predictor_name().c_str(),
                     (unsigned long long)(preds[k]->get_size() / 8),
                     (unsigned long long)misp[k], mr, 100.0 - mr, mpki);
+    }
+
+    // Optional CSV: append one row per predictor so sweeps across traces and
+    // size budgets accumulate in one file. Header written only for a new/empty
+    // file. budget_kb (from predictor_params.h) distinguishes size points.
+    if (csv_path) {
+        std::string label = path;
+        if (auto s = label.find_last_of('/'); s != std::string::npos) label = label.substr(s + 1);
+        if (label.size() > 3 && label.substr(label.size() - 3) == ".gz") label.resize(label.size() - 3);
+
+        bool need_header = true;
+        if (FILE* t = std::fopen(csv_path, "r")) {
+            if (std::fgetc(t) != EOF) need_header = false;
+            std::fclose(t);
+        }
+        FILE* csv = std::fopen(csv_path, "a");
+        if (!csv) { std::perror(csv_path); return 1; }
+        if (need_header)
+            std::fprintf(csv, "trace,budget_kb,predictor,size_bytes,instructions,"
+                              "cond_branches,mispredicts,mispred_pct,accuracy_pct,mpki\n");
+        for (size_t k = 0; k < preds.size(); k++) {
+            double mr   = ncond ? 100.0 * misp[k] / ncond : 0.0;
+            double mpki = ninst ? 1000.0 * misp[k] / ninst : 0.0;
+            std::fprintf(csv, "%s,%.3g,%s,%llu,%llu,%llu,%llu,%.4f,%.4f,%.4f\n",
+                         label.c_str(), NUM_KB, preds[k]->predictor_name().c_str(),
+                         (unsigned long long)(preds[k]->get_size() / 8),
+                         (unsigned long long)ninst, (unsigned long long)ncond,
+                         (unsigned long long)misp[k], mr, 100.0 - mr, mpki);
+        }
+        std::fclose(csv);
+        std::printf("\nappended %zu rows to %s\n", preds.size(), csv_path);
     }
     return 0;
 }

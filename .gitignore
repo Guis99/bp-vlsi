@@ -2,3 +2,5 @@
 **/.vscode
 
 **/build
+**/.cache
+hdl/STATE_FORMAT.md

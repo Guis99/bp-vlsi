@@ -102,162 +102,6 @@ class GSharePredictor : public BranchPredictorBase {
         }
 };
 
-class GSelectPredictor : public BranchPredictorBase {
-    public:
-        GSelectPredictor(size_t table_size, size_t history_length) {}
-
-        bool predict(u64 pc) override { return false; }
-        void update(u64 pc, BranchResult branch) override {}
-        std::string predictor_name() const override { return "GSelect"; }
-};
-
-class TwoLevelPredictor : public BranchPredictorBase {
-    size_t _table_size;
-    size_t _history_length;
-    size_t _pc_mask;
-    size_t _history_mask;
-    size_t _history_width;
-
-    std::vector<std::vector<SatCounter<2>>> pred_table;
-    std::vector<HistoryBuffer<64>> branch_history_table;
-
-    public:
-        TwoLevelPredictor(size_t table_size, size_t history_length) :
-                _table_size(1ull << table_size), _history_length(1ull << history_length), 
-                _pc_mask(_table_size - 1), _history_mask(_history_length - 1),
-                _history_width(history_length),
-                pred_table(_table_size, std::vector<SatCounter<2>>(1ull << history_length)),
-                branch_history_table(_table_size, HistoryBuffer<64>()) {}
-
-        u64 get_pc_idx(u32 pc) const {
-            return pc & _pc_mask;
-        }
-
-        u64 get_history_idx(size_t history) const {
-            return branch_history_table[history].as_idx() & _history_mask;
-        }
-
-        void update(u64 pc, BranchResult branch) override {
-            size_t pc_idx = get_pc_idx(pc);
-            size_t history_idx = get_history_idx(pc_idx);
-
-            branch_history_table[pc_idx].update(branch); // update branch history
-            COLLECT_ALIAS(pred_table[pc_idx][history_idx], pc);
-            pred_table[pc_idx][history_idx].update(branch); // update counter
-            COLLECT_TICK();
-        }
-
-        bool predict(u64 pc) override {
-            size_t pc_idx = get_pc_idx(pc);
-            size_t history_idx = get_history_idx(pc_idx);
-
-            return pred_table[pc_idx][history_idx].predict();
-        }
-
-        std::string predictor_name() const override { return "TwoLevel"; }
-
-        u64 get_size() const override {
-            u64 bht = _table_size * _history_width;
-            u64 counters = _table_size * _history_length * 2;
-            return bht + counters;
-        }
-};
-
-template <class Pred1, class Pred2>
-class TournamentPredictor : public BranchPredictorBase {
-    Pred1& predictor_1;
-    Pred2& predictor_2;
-    size_t table_size;
-    size_t pc_mask;
-    std::vector<SatCounter<2>> meta_pred_table;;
-    bool last_pred_1 = false;
-    bool last_pred_2 = false;
-    public:
-        TournamentPredictor(Pred1& predictor_1, Pred2& predictor_2, size_t table_size) :
-                predictor_1(predictor_1), 
-                predictor_2(predictor_2),
-                table_size(1ull << table_size), pc_mask(this->table_size - 1),
-                meta_pred_table(this->table_size, SatCounter<2>()) {}
-
-        size_t get_idx(size_t pc) const { return pc & pc_mask; }
-
-        void update(u64 pc, BranchResult branch) override {
-            size_t pc_idx = get_idx(pc);
-            
-            bool pred1_correct = last_pred_1 == branch;
-            bool pred2_correct = last_pred_2 == branch;
-
-            if (pred1_correct && !pred2_correct) {
-                meta_pred_table[pc_idx].update(BranchResult::TAKEN);
-            } else if (!pred1_correct && pred2_correct) {
-                meta_pred_table[pc_idx].update(BranchResult::NOT_TAKEN);
-            }
-
-            predictor_1.update(pc, branch);
-            predictor_2.update(pc, branch);
-        }
-
-        bool predict(u64 pc) override {
-            size_t pc_idx = get_idx(pc);
-
-            last_pred_1 = predictor_1.predict(pc);
-            last_pred_2 = predictor_2.predict(pc);
-
-            bool meta_prediction = meta_pred_table[pc_idx].predict();
-            if (meta_prediction) {
-                return last_pred_1;
-            } else {
-                return last_pred_2;
-            }
-        }
-
-        std::string predictor_name() const override { return "Tournament(" + predictor_1.predictor_name() + "," + predictor_2.predictor_name() + ")"; }
-
-        u64 get_size() const override {
-            return 2 * table_size + predictor_1.get_size() + predictor_2.get_size();
-        }
-};
-
-#define PRINT_ALLOC_DEBUG false
-
-class PerceptronPredictor : public BranchPredictorBase {
-    size_t table_size;
-    size_t history_length;
-    size_t pc_mask;
-    size_t history_mask;
-    std::vector<Perceptron> pred_table;
-    HistoryBuffer<64> history_buffer;
-
-    size_t get_idx(size_t pc) {
-        return pc & pc_mask;
-    }
-
-    public:
-        PerceptronPredictor(size_t table_size, size_t history_length) :
-                table_size(1ull << table_size), history_length(history_length),
-                pc_mask(this->table_size - 1), history_mask((1ull << history_length) - 1),
-                pred_table(this->table_size, Perceptron(history_length)),
-                history_buffer() {}
-
-        void update(u64 pc, BranchResult branch) override {
-            pred_table[get_idx(pc)].update(branch, history_buffer.as_idx() & history_mask, history_length);
-            history_buffer.update(branch);
-        }
-
-        bool predict(u64 pc) override {
-            return pred_table[get_idx(pc)].predict(history_buffer.as_idx() & history_mask, history_length);
-        }
-
-        std::string predictor_name() const override { return "PerceptronPredictor"; }
-
-        u64 get_size() const override {
-            u64 hb = history_length;
-
-            u64 perceptrons = table_size * 8 * (history_length + 1); // num_entries * size of int8 *(number of weights + bias)
-            return hb + perceptrons;
-        }
-};
-
 template<int H, int NC>
 class TAGEPredictor : public BranchPredictorBase {
     size_t _idx_width;
@@ -265,6 +109,7 @@ class TAGEPredictor : public BranchPredictorBase {
     size_t _table_size;
     size_t _bank_size;
     size_t _pc_mask;
+    size_t _idx_mask;
     size_t _tag_mask;
     constexpr static size_t U = 2;
 
@@ -313,7 +158,7 @@ class TAGEPredictor : public BranchPredictorBase {
 
     bool _is_entry_new(u16 top_idx) const {
         bool u_zeroed = _banks[_top_idx][top_idx].get_u() == 0;
-        bool ctr_weak = _banks[_top_idx][top_idx].get_ctr() == 3 || _banks[_top_idx][top_idx].get_ctr() == 4;
+        bool ctr_weak = (_banks[_top_idx][top_idx].get_ctr() == 3) || (_banks[_top_idx][top_idx].get_ctr() == 4);
         return u_zeroed && ctr_weak;
     }
 
@@ -363,7 +208,7 @@ class TAGEPredictor : public BranchPredictorBase {
         TAGEPredictor(size_t base_table_size, size_t idx_width, size_t tag_width, u8 num_comp, u16 L1, float ratio) :
                 _idx_width(idx_width), _tag_width(tag_width), 
                 _table_size(1ull << base_table_size), _bank_size(1ull<<_idx_width),
-                _pc_mask(_table_size - 1), _tag_mask((1ull << tag_width) - 1),
+                _pc_mask(_table_size - 1), _idx_mask(_bank_size - 1), _tag_mask((1ull << tag_width) - 1),
                 _history_buffer(),
                 _pred_table(_table_size, SatCounter<2>()), 
                 _banks(NC, std::vector<TagEntry<U>>(1ull << _idx_width, TagEntry<U>()))
@@ -379,7 +224,7 @@ class TAGEPredictor : public BranchPredictorBase {
                         throw(std::runtime_error(err_msg));
                     }
                     _history_lengths[i] = hl;    
-                    _hashes[2*i] = csr(_pc_mask, _idx_width, (hl - 1) % idx_width);
+                    _hashes[2*i] = csr(_idx_mask, _idx_width, (hl - 1) % idx_width);
                     _hashes[2*i+1] = csr(_tag_mask, _tag_width, (hl - 1) % tag_width);
                     // _hashes_2[i] = csr(_tag_mask, _tag_width - 1, (hl - 1) % tag_width);
                     _hashes_2[i] = csr( (1ull << (_tag_width - 1)) - 1, _tag_width - 1, (hl - 1) % (tag_width - 1));
@@ -447,7 +292,7 @@ class TAGEPredictor : public BranchPredictorBase {
 
             _history_buffer.update(branch);
 
-            if (_branches_seen++ > 256'000) {
+            if (_branches_seen++ >= 255'999) {
                 _reset_all_banks();
                 _branches_seen = 0;
             }
@@ -463,7 +308,7 @@ class TAGEPredictor : public BranchPredictorBase {
                 u32 tag_hash = _hashes[2*i+1].hash;
                 u32 tag_hash_2 = _hashes_2[i].hash;
 
-                u16 idx = (idx_hash ^ (pc & _pc_mask)) & (_bank_size - 1);
+                u16 idx = idx_hash ^ (pc & _idx_mask);
                 u16 tag = tag_hash ^ (tag_hash_2 << 1) ^ (pc & _tag_mask);
 
                 _idx_cache[i] = idx;
